@@ -67,11 +67,14 @@ class Summarizer(Analysis):
 
     def _try_summarize(self, f):
         l.debug('Attempting to hook: %s', f.name)
-        self._track_global_reads(f)
 
         if self._has_cycle(f):
             l.debug('Failed to hook: %s has cycles, skipping', f.name)
             return False
+
+        # TODO: After cycles to prevent it from breaking if read in a loop?
+        # I think it should be here before side effect check
+        self._track_global_reads(f)
 
         if self._has_side_effect(f):
             l.debug('Failed to hook: %s has side effects, skipping', f.name)
@@ -96,7 +99,11 @@ class Summarizer(Analysis):
             return False
 
     def _has_side_effect(self, f):
-        # the following may no longer be necessary
+        # TODO: Assumes any write to outside the base of the stack frame is a
+        #       side effect, and everything else is not
+        #       Not sure if address concretization messes with this
+
+        # The following may no longer be necessary (?)
         for b in f.blocks:
             if b.vex.jumpkind == 'Ijk_Call' and isinstance(b.vex.next, pyvex.expr.Const) \
                and b.vex.next.con.value in self._is_summarized:
@@ -170,7 +177,10 @@ class Summarizer(Analysis):
             state.memory.store(addr, var)
 
     def _generate_hook(self, f):
+        # TODO: Check types of args?
         num_args = f.num_arguments - 1
+
+        # TODO: hardcoded size
         sym_args = [claripy.BVS(self._fresh_name(), 64)
                     for _ in range(num_args)]
         hook_name = '__hook_%s' % f.name
@@ -203,6 +213,8 @@ class Summarizer(Analysis):
         return FHook
 
     def _get_symbolic_rval(self, f, *sym_args):
+        # TODO: handle floats properly?
+        # TODO: need to check if all paths return, not just some paths
         cc = f.calling_convention if f.calling_convention is not None \
                                   else simuvex.DefaultCC[self._p.arch.name](self._p.arch)
         deadend_addr = self._p._simos.return_deadend
