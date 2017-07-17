@@ -31,7 +31,7 @@ class Summarizer(Analysis):
         # Fix functions to try summarizing
         self._avoid = avoid
         self._to_summarize = {addr: f for addr, f in self._cfg.functions.iteritems()
-                              if _is_summary_candidate(addr, f)}
+                              if self._is_summary_candidate(addr, f)}
 
         # Generate summaries
         self._fresh_counter = itertools.count()
@@ -40,12 +40,12 @@ class Summarizer(Analysis):
         self._create_summaries()
 
     def _is_summary_candidate(self, addr, f):
-        return addr not in self.avoid and not f.is_simprocedure \
+        return addr not in self._avoid and not f.is_simprocedure \
                 and f.name not in self._bad_fns
 
     def _create_summaries(self):
         cg = self._p.kb.callgraph
-        work_cg = {addr: set(cg[addr].keys()) for addr in cg \
+        work_cg = {addr: set(cg[addr].keys()) for addr in self._to_summarize \
                    if all(map(lambda addr: addr in self._to_summarize, cg[addr]))}
 
         while True:
@@ -54,18 +54,18 @@ class Summarizer(Analysis):
             for addr in work_cg:
                 if len(work_cg[addr]) != 0: pass
                 if self._try_summarize(self._to_summarize[addr]):
-                    for addr in work_cg:
-                        work_cg[addr].discard(addr)
+                    for addr2 in work_cg:
+                        work_cg[addr2].discard(addr)
                     good.add(addr)
                 else:
                     bad.add(addr)
 
             if len(good) == 0: break
             work_cg = {addr: calls for addr, calls in work_cg.iteritems() \
-                       if addr not in good and \
+                       if addr not in good | bad and \
                           len(bad.intersection(calls)) == 0}
 
-    def _try_summarize(f):
+    def _try_summarize(self, f):
         l.debug('Attempting to hook: %s', f.name)
         self._track_global_reads(f)
 
@@ -83,21 +83,24 @@ class Summarizer(Analysis):
             return False
 
         l.debug('Hook generated for: %s', f.name)
-        self._is_summarized[f.addr] = f
+        self._is_summarized[f.addr] = angr.Hook(FHook)
 
-        self._p.hook(f.addr, angr.Hook(FHook))
+        self._p.hook(f.addr, self._is_summarized[f.addr])
         return True
 
-    def _has_cycle(f):
+    def _has_cycle(self, f):
         try:
             next(nx.simple_cycles(f.graph))
             return True
         except StopIteration:
             return False
 
-    def _has_side_effect(f):
+    def _has_side_effect(self, f):
         # the following may no longer be necessary
         for b in f.blocks:
+            if b.vex.jumpkind == 'Ijk_Call' and isinstance(b.vex.next, pyvex.expr.Const) \
+               and b.vex.next.con.value in self._is_summarized:
+                continue
             if b.vex.jumpkind not in ['Ijk_Boring', 'Ijk_Ret']:
                 return True
 
@@ -116,7 +119,7 @@ class Summarizer(Analysis):
 
         base_sp = state.regs.sp
         stack_grows_to_zero = self._p.arch.stack_change < 0
-        stack_lim = self._p.arch.initial_sp - self._P.arch.stack_size \
+        stack_lim = self._p.arch.initial_sp - self._p.arch.stack_size \
                     if stack_grows_to_zero \
                     else self._p.arch.initial_sp + self._p.arch.stack_size
 
@@ -144,10 +147,10 @@ class Summarizer(Analysis):
 
         return callback.has_effect
 
-    def _fresh_name():
-        return '__tmpvar__%d' % next(_fresh_counter)
+    def _fresh_name(self):
+        return '__tmpvar__%d' % next(self._fresh_counter)
 
-    def _track_global_reads(f):
+    def _track_global_reads(self, f):
         reads = {}
         for b in f.blocks:
             for exp in b.vex.expressions:
@@ -162,11 +165,11 @@ class Summarizer(Analysis):
             symvar = claripy.BVS(self._fresh_name(), sz)
             self._globals[read_addr] = symvar
 
-    def _abstract_globals(state):
+    def _abstract_globals(self, state):
         for addr, var in self._globals.iteritems():
             state.memory.store(addr, var)
 
-    def _generate_hook(f):
+    def _generate_hook(self, f):
         num_args = f.num_arguments - 1
         sym_args = [claripy.BVS(self._fresh_name(), 64)
                     for _ in range(num_args)]
@@ -180,7 +183,7 @@ class Summarizer(Analysis):
             simuvex.SimProcedure.__init__(self, *args, **kwargs)
 
         def run(self, *actual_args):
-            rs = self.state.se._solve
+            rs = self.state.se._solver
             for o, n in zip(sym_args, actual_args):
                 if isinstance(n, simuvex.SimActionObject):
                     n = n.to_claripy()
@@ -190,18 +193,20 @@ class Summarizer(Analysis):
                 rs.add_replacement(sym, self.state.memory.load(addr, sym.size()/8))
 
             rep_val = rs._replacement(rval)
+            # TODO: Should be remove_replacements, update once they fix that function
             rs.clear_replacements()
+            l.debug('Hook %s(%s): %s', hook_name, actual_args, rep_val)
             return rep_val
 
         FHook = type(hook_name, (simuvex.SimProcedure,), {'__init__': __init__,
                                                           'run': run})
         return FHook
 
-    def _get_symbolic_rval(f, *sym_args):
+    def _get_symbolic_rval(self, f, *sym_args):
         cc = f.calling_convention if f.calling_convention is not None \
                                   else simuvex.DefaultCC[self._p.arch.name](self._p.arch)
         deadend_addr = self._p._simos.return_deadend
-        state = self._p.factory.call_state(f.addr, *args,
+        state = self._p.factory.call_state(f.addr, *sym_args,
                                            cc=cc,
                                            base_state=None,
                                            ret_addr = deadend_addr,
@@ -212,14 +217,25 @@ class Summarizer(Analysis):
         caller = self._p.factory.path_group(state, immutable=True)
         caller_end_unpruned = caller.step(until=lambda pg: len(pg.active) == 0) \
                                     .unstash(from_stash='deadended')
-        caller_end_unmerged = called_end_unpruned.prune(
+        caller_end_unmerged = caller_end_unpruned.prune(
                                 filter_func=lambda pt: pt.addr == deadend_addr)
         if len(caller_end_unmerged.active) == 0:
             return None
         rstate = caller_end_unmerged.merge().active[0].state
-        rval = rstate.simplify(cc.get_return_value(rstate,
-                                                   stack_base=rstate.regs.sp - \
-                                                   cc.STACKARG_SP_DIFF)
+        rval = rstate.simplify(cc.get_return_val(rstate,
+                                                 stack_base=rstate.regs.sp - \
+                                                 cc.STACKARG_SP_DIFF))
         return rval
+    
+    def hook_all(self):
+        for addr, hk in self._is_summarized.iteritems():
+            self.project.hook(addr, hk)
+
+    def hook_some(self, addrs):
+        for addr in addrs:
+            self.project.hook(addr, self._is_summarized[addr])
+
+    def get_summaries(self):
+        return self._is_summarized
 
 register_analysis(Summarizer, 'Summarizer')
