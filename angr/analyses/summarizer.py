@@ -15,11 +15,6 @@ class Summarizer(Analysis):
     """
     Attempt to create function summaries.
     """
-
-    _bad_fns = {'_init', '__stack_chk_fail', '__libc_start_main',
-                '_start', 'deregister_tm_clones', '__do_global_dtors_aux', 'frame_dummy',
-                '__libc_csu_init'}
-
     def __init__(self, avoid=set()):
         # TODO: Can't get old options list? Can avoid regenerating CFGAccurate?
         l.debug('Generating CFG')
