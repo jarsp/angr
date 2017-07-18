@@ -16,16 +16,21 @@ class Summarizer(Analysis):
     Attempt to create function summaries.
     """
 
-    _bad_fns = {'_init', '__stack_chk_fail', '__libc_start_main', 'sub_400440',
+    _bad_fns = {'_init', '__stack_chk_fail', '__libc_start_main',
                 '_start', 'deregister_tm_clones', '__do_global_dtors_aux', 'frame_dummy',
                 '__libc_csu_init'}
 
     def __init__(self, avoid=set()):
         # TODO: Can't get old options list? Can avoid regenerating CFGAccurate?
-        l.debug('Generating CFGAccurate')
+        l.debug('Generating CFG')
+        # Need to use CFG accurate to get argument count analysis, or I have to
+        # do it myself
         self._p = angr.Project(self.project.filename,
                                load_options={'auto_load_libs': False})
         self._cfg = self._p.analyses.CFGAccurate(keep_state=True)
+        #self._p = angr.Project(self.project.filename,
+        #                       load_options={'auto_load_libs': False})
+        #self._cfg = self._p.analyses.CFG()
         l.debug('CFG Generated')
 
         # Fix functions to try summarizing
@@ -35,18 +40,69 @@ class Summarizer(Analysis):
 
         # Generate summaries
         self._fresh_counter = itertools.count()
-        self._globals = {}
+        self._globals = None
         self._is_summarized = {}
         self._create_summaries()
 
     def _is_summary_candidate(self, addr, f):
-        return addr not in self._avoid and not f.is_simprocedure \
-                and f.name not in self._bad_fns
+        # Should patch for MIPS, see https://github.com/angr/fidget/blob/master/fidget/structures.py#L214
+
+        # Skip user avoided functions
+        if addr in self._avoid:
+            l.debug('Function %s avoided', f.name)
+            return False
+
+        # Skip _start
+        if addr == self._p.entry:
+            l.debug('Skipping entry point')
+            return False
+
+        # Don't try to patch simprocedures
+        if self._p.is_hooked(addr):
+            l.debug('Skipping simprocedure %s',
+                    self._p.hooked_by(addr).procedure.__name__)
+            return False
+
+        # Same as above
+        if f.is_simprocedure:
+            l.debug('Skipping simprocedure %s', f.name)
+            return False
+
+        # Don't touch functions not in any segment
+        if self._p.loader.main_bin.find_segment_containing(addr) is None:
+            l.debug('Skipping function %s not mapped', f.name)
+            return False
+
+        # Don't touch functions not in .text if it exists
+        if '.text' in self._p.loader.main_bin.sections_map:
+            sec = self._p.loader.main_bin.find_section_containing(addr)
+            if sec is None or sec.name != '.text':
+                l.debug('Skipping function %s not in .text', f.name)
+                return False
+
+        # Don't patch PLT functions
+        if addr in self._p.loader.main_bin.plt.values():
+            l.debug('Skipping function %s in PLT', f.name)
+            return False
+
+        # Skip unresolved indirect jumps that CFG couldn't parse
+        if f.has_unresolved_jumps:
+            l.debug('Skipping function %s with unresolved jumps', f.name)
+            return False
+
+        # Check if function starts at a SimProcedure (edge case)
+        if self._cfg.get_any_node(addr).simprocedure_name is not None:
+            l.debug('Skipping function %s starting with a SimProcedure', f.name)
+            return False
+
+        # Nice!
+        return True
 
     def _create_summaries(self):
         cg = self._p.kb.callgraph
-        work_cg = {addr: set(cg[addr].keys()) for addr in self._to_summarize \
-                   if all(map(lambda addr: addr in self._to_summarize, cg[addr]))}
+        work_cg = {addr: set(cg[addr].keys()) for addr in cg \
+                   if addr in self._to_summarize \
+                      and all(map(lambda addr: addr in self._to_summarize, cg[addr]))}
 
         while True:
             good = set()
@@ -71,10 +127,6 @@ class Summarizer(Analysis):
         if self._has_cycle(f):
             l.debug('Failed to hook: %s has cycles, skipping', f.name)
             return False
-
-        # TODO: After cycles to prevent it from breaking if read in a loop?
-        # I think it should be here before side effect check
-        self._track_global_reads(f)
 
         if self._has_side_effect(f):
             l.debug('Failed to hook: %s has side effects, skipping', f.name)
@@ -103,8 +155,11 @@ class Summarizer(Analysis):
         #       side effect, and everything else is not
         #       Not sure if address concretization messes with this
 
-        # The following may no longer be necessary (?)
         for b in f.blocks:
+            # Technically I don't need this?
+            for stmt in b.vex.statements:
+                if isinstance(stmt, pyvex.stmt.Dirty):
+                    return True
             if b.vex.jumpkind == 'Ijk_Call' and isinstance(b.vex.next, pyvex.expr.Const) \
                and b.vex.next.con.value in self._is_summarized:
                 continue
@@ -157,27 +212,20 @@ class Summarizer(Analysis):
     def _fresh_name(self):
         return '__tmpvar__%d' % next(self._fresh_counter)
 
-    def _track_global_reads(self, f):
-        reads = {}
-        for b in f.blocks:
-            for exp in b.vex.expressions:
-                if exp.tag == 'Iex_Load' and exp.addr.tag == 'Iex_Const':
-                    addr = exp.addr.con.value
-                    sz = simuvex.engines.vex.size_bits(exp.ty)
-                    if addr not in reads or sz > reads[addr]:
-                        reads[addr] = sz
-
-        # TODO: LLSC, CAS, LOADG, etc.
-        for read_addr, sz in reads.iteritems():
-            symvar = claripy.BVS(self._fresh_name(), sz)
-            self._globals[read_addr] = symvar
-
     def _abstract_globals(self, state):
+        if self._globals is None:
+            self._globals = {}
+            secs = filter(lambda s: s.is_readable and (s.name == '.data' or s.name == '.bss'),
+                          self._p.loader.main_bin.sections)
+            for s in secs:
+                self._globals[s.min_addr] = claripy.BVS(self._fresh_name(),
+                                                        s.memsize * 8)
         for addr, var in self._globals.iteritems():
             state.memory.store(addr, var)
 
     def _generate_hook(self, f):
         # TODO: Check types of args?
+        # It seems to count one more than actual number of args on x64?
         num_args = f.num_arguments - 1
 
         # TODO: hardcoded size
@@ -209,7 +257,8 @@ class Summarizer(Analysis):
             return rep_val
 
         FHook = type(hook_name, (simuvex.SimProcedure,), {'__init__': __init__,
-                                                          'run': run})
+                                                          'run': run,
+                                                          'rval': rval})
         return FHook
 
     def _get_symbolic_rval(self, f, *sym_args):
